@@ -1,0 +1,240 @@
+---
+title: "Modelling"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+```
+
+## Data Prep (Yes, there's more...) 
+
+First we need to make sure we have the data from the summary stuff. Below we load in the oviposition data at Broad habitat levels 1 and 2, as well as the phylogenetic tree we made prior.
+
+```{r}
+library(tidyverse)
+library(tidybayes)
+library(ape)
+library(brms)
+```
+
+```{r}
+# Habitat level 1, the broadest classification
+ovipos_hab1 <- read_csv("Oviposition_Summary_Hab1.csv")
+
+# Habitat level 2, a less broad type
+ovipos_hab2 <- read_csv("Oviposition_Summary_Hab2.csv")
+
+# A Tree with all the species we need in it
+tree <- read.tree("final_tree.new")
+```
+
+Quickly we will put a `_` inbetween the genus and species of our mosquito names because they don't play well with gaps in their names using the phylogenetic tree data.
+
+```{r}
+# Replcae " " with "_" in msoquito_species and give us it back 
+ovipos_hab1 <- ovipos_hab1 %>% mutate(mosquito_species = str_replace(mosquito_species, " ", "_"))
+ovipos_hab2 <- ovipos_hab2 %>% mutate(mosquito_species = str_replace(mosquito_species, " ", "_"))
+```
+
+Now we need to make sure we have the right species in our tree, so the same ones in our dataframe, and make a distance matrix or covariance-variance matrix. A nice function in the `caper` package will do all this for us and put it in a nice list where can then call objects from.
+
+```{r}
+library(caper)
+
+# This is to remove a duplicated tip label in the tree - my fault when assembling
+which(duplicated(tree$tip.label))
+
+# We can rename it and it will be removed in the next step
+tree$tip.label[12] <- "DuplicatedSpp"
+
+# This is a nice function to generate an object with all the same tips, phylo, VCV, and data for a cetrain tree.
+hab1 <- comparative.data(phy = tree, data = as.data.frame(ovipos_hab1), names.col = mosquito_species, vcv = TRUE)
+
+# This is the structure
+hab1
+```
+
+## Phylogenetic Logistic Regression
+I can't get any of the phylogenetic models to run, ape::binaryPGLMM, phylolm:phyloglm or pez::communityPGLMM. So isntead have done what I can to get this all to work in BRMS, and to my surprise, it works quite well and sampling is good. 
+
+For BRMS to work with phylogeny models using stan we need a variance-covariance matrix (vcv) from our phylogeny. This is easily done with `ape::vcv.phylo()`.
+
+We also need the data to have the mosquito species as a actual variable and not rownames, and a formula explaining the structure of what we want to predict to transfer to stan code. 
+
+```{r}
+# This gets us our VCV
+A <- ape::vcv.phylo(hab1$phy)
+
+# this gets us our dataframe with the mosquitoes in the data and not as a rowname
+data <- hab1$data %>% rownames_to_column(var = "mosquito_species")
+
+# Formula design  for just habitat predictors:
+habs <- data %>% dplyr::select(hab_1_e:hab_1_a) %>% colnames()
+
+# The formula
+habformula <- 
+  # vector is outcome var at the start
+  paste("vector ~ ", 
+        # now paste all the habitat vars as interaction predictors with "+" in the middle
+        paste(habs, collapse = " + "), 
+        # this deals with our phylogeny telling brms to look for this vcv 
+        # to apply to mosquito species in our dataframe as a random effect
+        "+ (1 | gr(mosquito_species, cov = A))")
+
+```
+
+Overall the formula for this model looks like this:
+```{r}
+habformula
+```
+Now lets compile the model using multiple cores, I've turned off the ouput because it can take a while and fill up the page with goop.
+
+```{r include=FALSE}
+model_simple <-
+  # The model function
+  brm(
+    # Using our predictive formula
+    formula = habformula,
+    # The data to run the model on lives here
+    data = data,
+    # This is the distribution to use, bernoulli is a more efficient binomial variable
+    # effectively a special case when the values are just one set of yes or no (binary)
+    family = bernoulli(link = "logit"),
+    # This tells the model where the vcv matrix is and allows it to use it
+    data2 = list(A = A),
+    # Use multiple cores
+    cores = 4,
+    # these are the prior distributions for our variables - these are fairly normal
+    prior =
+      c(
+        # Prior for any covariates
+        prior(normal(0, 10), "b"),
+        # Prior for the intercept
+        prior(normal(0, 50), "Intercept"),
+        # Prior for the standard deviation
+        prior(student_t(3, 0, 20), "sd")
+        ),
+    # This tells the model to travesre the probability space slower
+    # effectively giving us a better result but takes more time
+    # used to solve some sampling issues
+    control = list(
+      adapt_delta = 0.99
+    ),
+    # We  need this for later with LOO
+    save_all_pars = TRUE
+  )
+```
+
+So instead here is out model output.
+```{r}
+model_simple
+```
+
+Below shows convergence information for the chains and estiamtes for the parameters of each covariate.
+```{r}
+plot(model_simple, N = 2, ask = FALSE)
+```
+
+This function `mcmcplot()` will show you the posterior predictive distribution, default values are thin line = 0.95% HDI, and thick line = 50% HDI
+```{r}
+mcmc_plot(model_simple)
+```
+
+
+
+The `ppcheck()` function runs a posterior predictive chek ont he model, estimating how well the model would fit to new data, basically the lines should be close and of similar shapes.
+```{r}
+# Full model
+pp_check(model_simple)
+# For a specific variable
+pp_check(model_simple, resp = "hab_1_e") + ggtitle("ppcheck function for the response variable hab_1_e")
+```
+
+## No phylogeny?
+
+What about an example where we don't include the phylogenetic effects of the species?
+```{r include=FALSE}
+nophylohabformula <-
+  # the same as the other formula but we wont include the vcv for the random effect
+  paste("vector ~ ", paste(habs, collapse = " + "))
+
+model_nophylo <-
+  # The model function
+  brm(
+    # Using our predictive formula
+    formula = nophylohabformula,
+    # The data to run the model on lives here
+    data = data,
+    # This is the distribution to use, bernoulli is a more efficient binomial variable
+    # effectively a special case when the values are just one set of yes or no (binary)
+    family = bernoulli(link = "logit"),
+    # Use multiple cores
+    cores = 4,
+    # these are the prior distributions for our variables - these are fairly normal
+    prior =
+      c(
+        # Prior for any covariates
+        prior(normal(0, 10), "b"),
+        # Prior for the intercept
+        prior(normal(0, 50), "Intercept")
+        ),
+    # This tells the model to travesre the probability space slower
+    # effectively giving us a better result but takes more time
+    # used to solve some sampling issues
+    control = list(
+      adapt_delta = 0.99
+    ), save_all_pars = TRUE
+  )
+```
+
+```{r}
+model_nophylo
+```
+Just by looking at the lower 95% and upper 95% intervals we can see that not including the phylogenetic effect of the model makes some predictors more likely to determine a mosquito a vector or not. This must mean that the phylogenetic effect is important in the model we specified earlier, and biologically is probably more accurate too.
+
+We can pull those out and see them more clearly using the `fixef()` function on our model, and then transforming the parameters back out of the logit link space that we used to fit the model using `inv_logit_scaled()`.
+
+```{r}
+fixef(model_nophylo) %>% inv_logit_scaled()
+```
+
+We should try and compare our models using some information criterion, you can use LOO or WAIC for bayesian models. Here we would expect the criterion for our non-phylo including model to be much simpler because there are far less parameters, but does it predict as well?
+
+Using loo the model gets refit lots and lots of times leaving out covariates as it goes, this will take a long time but can be worth it. The result is a metric called ELPD. A negative ELPD_diff means the model predicts worse than the baseline model (0)
+
+```{r, cache=TRUE}
+model_simple <- add_criterion(model_simple, "loo")
+model_nophylo <- add_criterion(model_nophylo, "loo")
+
+loo_compare(model_simple, model_nophylo)
+```
+So here, from our results we see that despite there being more parameters in the phylogenetic model, when we use it to predict it gets the right answer more often, and is therefore the better model. We should use the phylogenetic random effect in our models.
+
+Lastly we should look at `launch_shinystan()` to see the model in more depth. From Shinystan you can actually download pdf/ggplot objects of the plots and tables that describe the model. This should make for quick inputting into your report Lucy, without the need for too much effort! You should find these in the estimate tab of Shinystan.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
