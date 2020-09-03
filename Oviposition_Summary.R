@@ -14,6 +14,10 @@ library(read.so)
 # to .txt files
 oviposition_data <- read.so::read_md("Oviposition.txt")
 
+# New code to change artificial and ground pool to better names
+oviposition_data <- oviposition_data %>% mutate(Microsite = str_replace(Microsite, "Artificial", "ArtificialCon"),
+                                                Microsite = str_replace(Microsite, "Ground Pool", "GroundPool"))
+
 # Are any values NA in the ID column? (Blank lines)
 if (any(is.na(oviposition_data$Oviposition_ID))) {
   stop(print("NA lines in the data file"))
